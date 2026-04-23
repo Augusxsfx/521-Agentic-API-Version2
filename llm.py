@@ -18,12 +18,13 @@ from typing import Iterable
 
 from openpyxl import load_workbook
 
-DATA_PATH = Path(__file__).with_name("tmdb_top1000_movies.xlsx")
+DEFAULT_DATA_PATH = Path(__file__).with_name("tmdb_top1000_movies.xlsx")
+DATA_PATH = Path(os.getenv("MOVIE_DATA_PATH", str(DEFAULT_DATA_PATH))).expanduser()
 DESCRIPTION_LIMIT = 500
 MODEL = "gemma4:31b-cloud"
 OLLAMA_HOST = "https://ollama.com"
 LLM_CHAR_BUDGET = 420
-REQUEST_TIMEOUT_SECONDS = 8
+REQUEST_TIMEOUT_SECONDS = 12
 CRITIC_REVIEW_MIN_BUDGET_SECONDS = 1.6
 CRITIC_REWRITE_MIN_BUDGET_SECONDS = 1.0
 CRITIC_REVIEW_TIMEOUT_SECONDS = 1.2
@@ -154,6 +155,11 @@ PHRASE_HINTS = {
     "superhero": ["superhero", "comic", "hero", "villain", "marvel", "dc"],
     "buddy cop": ["buddy", "banter", "team-up", "partners", "crime", "cop"],
     "feel good": ["uplifting", "warm", "fun", "heart", "hopeful"],
+    "happy": ["uplifting", "warm", "fun", "hopeful", "joyful", "heartwarming"],
+    "sad": ["tragic", "heartbreak", "melancholy", "loss", "grief", "tearjerker"],
+    "giggles": ["comedy", "funny", "laughs", "witty", "lighthearted"],
+    "laugh": ["comedy", "funny", "laughs", "witty", "lighthearted"],
+    "heartbreaking": ["tragic", "heartbreak", "melancholy", "loss", "grief"],
     "emotional": ["moving", "heartwarming", "character", "drama"],
     "strong story": ["drama", "character", "relationship", "psychological", "mystery"],
     "interesting characters": ["character", "relationship", "ensemble", "psychological", "drama"],
@@ -216,6 +222,40 @@ HAPPY_THEME_TOKENS = {
     "uplifting",
     "joy",
     "adventure",
+}
+
+HAPPY_REQUEST_PHRASES = {
+    "happy",
+    "feel good",
+    "feel-good",
+    "uplifting",
+    "cheerful",
+    "lighthearted",
+    "joyful",
+    "wholesome",
+    "giggles",
+    "giggly",
+    "laugh",
+    "laughs",
+    "laughing",
+    "funny",
+    "cheer me up",
+    "pick me up",
+}
+
+SAD_REQUEST_PHRASES = {
+    "sad",
+    "tearjerker",
+    "heartbreaking",
+    "tragic",
+    "melancholy",
+    "bleak",
+    "depressing",
+    "bittersweet",
+    "cry",
+    "crying",
+    "make me cry",
+    "devastating",
 }
 
 LOW_RATED_PHRASES = {
@@ -445,8 +485,27 @@ def _safe_float(value: object) -> float:
         return 0.0
 
 
+def set_data_path(data_file: str | Path | None = None) -> Path:
+    global DATA_PATH
+
+    candidate = Path(data_file).expanduser() if data_file else DEFAULT_DATA_PATH
+    if candidate == DATA_PATH:
+        return DATA_PATH
+
+    DATA_PATH = candidate
+    load_movies.cache_clear()
+    movie_lookup.cache_clear()
+    title_lookup.cache_clear()
+    token_idf.cache_clear()
+    semantic_backend.cache_clear()
+    return DATA_PATH
+
+
 @lru_cache(maxsize=1)
 def load_movies() -> tuple[Movie, ...]:
+    if not DATA_PATH.exists():
+        raise FileNotFoundError(f"Movie catalog not found: {DATA_PATH}")
+
     workbook = load_workbook(DATA_PATH, read_only=True, data_only=True)
     sheet = workbook.active
     rows = sheet.iter_rows(values_only=True)
@@ -763,6 +822,7 @@ def heuristic_extract_preferences(preferences: str) -> dict[str, object]:
     prefer_non_english = False
     prefer_low_rated = False
     prefer_happy_ending = False
+    prefer_sad_tone = False
     min_year: int | None = None
     max_year: int | None = None
     min_runtime: int | None = None
@@ -825,6 +885,18 @@ def heuristic_extract_preferences(preferences: str) -> dict[str, object]:
         for token in ["heartwarming", "hopeful", "uplifting", "friendship", "family", "fun"]:
             token_weights[token] += 2.5
         preferred_genres.update({"family", "comedy", "adventure"})
+
+    if any(contains_normalized_phrase(normalized, phrase) for phrase in HAPPY_REQUEST_PHRASES):
+        prefer_happy_ending = True
+        for token in ["heartwarming", "hopeful", "uplifting", "friendship", "family", "fun", "joy"]:
+            token_weights[token] += 2.5
+        preferred_genres.update({"family", "comedy", "adventure", "animation"})
+
+    if any(contains_normalized_phrase(normalized, phrase) for phrase in SAD_REQUEST_PHRASES):
+        prefer_sad_tone = True
+        for token in ["grief", "tragic", "tragedy", "loss", "melancholy", "heartbreak"]:
+            token_weights[token] += 2.5
+        preferred_genres.update({"drama"})
 
     if any(phrase in normalized for phrase in LOW_RATED_PHRASES):
         prefer_low_rated = True
@@ -940,6 +1012,7 @@ def heuristic_extract_preferences(preferences: str) -> dict[str, object]:
         "prefer_non_english": prefer_non_english,
         "prefer_low_rated": prefer_low_rated,
         "prefer_happy_ending": prefer_happy_ending,
+        "prefer_sad_tone": prefer_sad_tone,
         "min_year": min_year,
         "max_year": max_year,
         "min_runtime": min_runtime,
@@ -979,41 +1052,29 @@ Extract the user's intent into exactly this JSON format. No markdown or text.
   "must_not_have_genres": [],
   "target_eras": ["any"], 
   "discovery_mode": "neutral", 
+    "mood": "neutral",
+    "energy": "any",
   "vibe_keywords": []
 }}
 
 Rules for values:
 target_eras choices: list containing any of ["classic", "90s", "2000s", "recent", "any"]
 discovery_mode choices: "hidden_gem" (unknown/underrated), "blockbuster" (popular/famous), "neutral"
+mood choices: "happy", "sad", "tense", "dark", "romantic", "neutral"
+energy choices: "low", "medium", "high", "any"
 vibe_keywords: max 5 english words describing pacing or vibe (e.g. short, fast, creepy)
 """
 
-    try:
-        response = requests.post(
-            f"{OLLAMA_HOST}/api/chat",
-            headers={"Authorization": f"Bearer {api_key}"},
-            json={
-                "model": MODEL,
-                "messages": [
-                    {
-                        "role": "system",
-                        "content": "You are an intent extractor. Return ONLY valid JSON."
-                    },
-                    {"role": "user", "content": prompt},
-                ],
-                "stream": False,
+    return _post_json_chat(
+        [
+            {
+                "role": "system",
+                "content": "You are an intent extractor. Return ONLY valid JSON.",
             },
-            timeout=3,
-        )
-        response.raise_for_status()
-        content = response.json().get("message", {}).get("content", "").strip()
-        match = re.search(r"\{.*\}", content, re.DOTALL)
-        if match:
-            parsed = json.loads(match.group(0))
-            return parsed
-    except Exception:
-        pass
-    return None
+            {"role": "user", "content": prompt},
+        ],
+        min(4.0, REQUEST_TIMEOUT_SECONDS),
+    )
 
 
 def extract_preferences(preferences: str) -> dict[str, object]:
@@ -1064,10 +1125,42 @@ def build_query_weights(
     query_weights: Counter[str] = Counter(signals["token_weights"])
 
     if "agent_intent" in signals:
+        mood = str(signals["agent_intent"].get("mood", "neutral")).lower()
+        energy = str(signals["agent_intent"].get("energy", "any")).lower()
         vibe_keywords = signals["agent_intent"].get("vibe_keywords", [])
         for vibe in vibe_keywords:
             for token in tokenize(vibe):
                 query_weights[token] += 3.0
+
+        if mood == "happy":
+            for token in ["heartwarming", "hopeful", "uplifting", "friendship", "family", "fun", "joyful"]:
+                for part in tokenize(token):
+                    query_weights[part] += 2.5
+        elif mood == "sad":
+            for token in ["tragic", "heartbreak", "melancholy", "loss", "grief", "tearjerker"]:
+                for part in tokenize(token):
+                    query_weights[part] += 2.5
+        elif mood == "tense":
+            for token in ["tension", "suspense", "thriller", "intense"]:
+                for part in tokenize(token):
+                    query_weights[part] += 2.5
+        elif mood == "dark":
+            for token in ["dark", "bleak", "psychological", "brooding"]:
+                for part in tokenize(token):
+                    query_weights[part] += 2.5
+        elif mood == "romantic":
+            for token in ["romance", "chemistry", "love", "relationship"]:
+                for part in tokenize(token):
+                    query_weights[part] += 2.5
+
+        if energy == "high":
+            for token in ["action", "thriller", "intense", "fast", "momentum"]:
+                for part in tokenize(token):
+                    query_weights[part] += 2.0
+        elif energy == "low":
+            for token in ["gentle", "quiet", "calm", "slow", "character"]:
+                for part in tokenize(token):
+                    query_weights[part] += 2.0
 
     history_strength = 1.0 if len(query_weights) < 4 and not signals["preferred_genres"] else 0.35
 
@@ -1107,6 +1200,7 @@ def score_movie(
     movie_genres = {normalize_text(genre) for genre in movie.genres}
     prefer_low_rated = bool(signals.get("prefer_low_rated"))
     prefer_happy_ending = bool(signals.get("prefer_happy_ending"))
+    prefer_sad_tone = bool(signals.get("prefer_sad_tone"))
 
     if signals["preferred_languages"]:
         if movie.original_language in signals["preferred_languages"]:
@@ -1167,14 +1261,35 @@ def score_movie(
         for genre in ("family", "comedy", "adventure", "animation", "romance"):
             if genre in movie_genres:
                 score += 2.5
-        for genre in ("horror", "war", "history"):
+        for genre in ("horror", "war", "history", "drama"):
             if genre in movie_genres:
                 score -= 4.0
 
         happy_hits = sum(1 for token in HAPPY_THEME_TOKENS if token in movie.token_set)
         sad_hits = sum(1 for token in SAD_THEME_TOKENS if token in movie.token_set)
-        score += min(happy_hits, 3) * 1.5
-        score -= min(sad_hits, 3) * 2.5
+        score += min(happy_hits, 3) * 2.0
+        score -= min(sad_hits, 3) * 4.0
+        if sad_hits == 0:
+            score += 2.0
+        if sad_hits and sad_hits >= happy_hits:
+            score -= 6.0
+
+    if prefer_sad_tone:
+        for genre in ("drama", "romance", "history"):
+            if genre in movie_genres:
+                score += 2.5
+        for genre in ("family", "comedy"):
+            if genre in movie_genres:
+                score -= 3.0
+
+        sad_hits = sum(1 for token in SAD_THEME_TOKENS if token in movie.token_set)
+        happy_hits = sum(1 for token in HAPPY_THEME_TOKENS if token in movie.token_set)
+        score += min(sad_hits, 3) * 4.0
+        score -= min(happy_hits, 3) * 2.0
+        if sad_hits == 0:
+            score -= 2.0
+        if happy_hits and happy_hits >= sad_hits:
+            score -= 6.0
 
     for genre in signals["preferred_genres"]:
         if genre in movie_genres:
@@ -1248,6 +1363,48 @@ def score_movie(
                 score -= 100.0  # CRUSHING PENALTY
 
         discovery_mode = agent_intent.get("discovery_mode", "neutral")
+        mood = str(agent_intent.get("mood", "neutral")).lower()
+        energy = str(agent_intent.get("energy", "any")).lower()
+
+        if mood == "happy" and not prefer_sad_tone:
+            happy_hits = sum(1 for token in HAPPY_THEME_TOKENS if token in movie.token_set)
+            sad_hits = sum(1 for token in SAD_THEME_TOKENS if token in movie.token_set)
+            if any(genre in movie_genres for genre in {"family", "comedy", "adventure", "animation", "romance"}):
+                score += 2.5
+            if any(genre in movie_genres for genre in {"horror", "war", "history"}):
+                score -= 3.0
+            score += min(happy_hits, 3) * 1.5
+            score -= min(sad_hits, 3) * 2.0
+        elif mood == "sad" and not prefer_happy_ending:
+            happy_hits = sum(1 for token in HAPPY_THEME_TOKENS if token in movie.token_set)
+            sad_hits = sum(1 for token in SAD_THEME_TOKENS if token in movie.token_set)
+            if any(genre in movie_genres for genre in {"drama", "romance", "history"}):
+                score += 2.5
+            if any(genre in movie_genres for genre in {"family", "comedy"}):
+                score -= 3.0
+            score += min(sad_hits, 3) * 1.5
+            score -= min(happy_hits, 3) * 1.5
+        elif mood == "tense":
+            if any(genre in movie_genres for genre in {"thriller", "mystery", "crime", "horror"}):
+                score += 2.5
+        elif mood == "dark":
+            if any(genre in movie_genres for genre in {"thriller", "crime", "drama", "horror"}):
+                score += 2.5
+        elif mood == "romantic":
+            if any(genre in movie_genres for genre in {"romance", "comedy", "drama"}):
+                score += 2.5
+
+        if energy == "high":
+            if any(genre in movie_genres for genre in {"action", "adventure", "thriller"}):
+                score += 2.0
+            if movie.runtime_min is not None and movie.runtime_min < 110:
+                score += 1.0
+        elif energy == "low":
+            if any(genre in movie_genres for genre in {"drama", "romance", "animation"}):
+                score += 1.5
+            if movie.runtime_min is not None and movie.runtime_min > 150:
+                score -= 1.5
+
         if prefer_low_rated:
             score -= movie.quality_score * 4.0
             score += (6.6 - movie.vote_average) * 10.0
@@ -1728,6 +1885,7 @@ def choose_top_movies(
 ) -> tuple[list[Movie], dict[str, object], dict[str, Counter[str]], set[int]]:
     watched_ids = watched_movie_ids(history, history_ids)
     query_weights, signals, history_profile = build_query_weights(preferences, history, history_ids)
+    preferred_languages = set(signals.get("preferred_languages", set()))
     strict_min_year = bool(signals.get("strict_min_year"))
     strict_max_year = bool(signals.get("strict_max_year"))
     min_year = signals.get("min_year")
@@ -1738,6 +1896,8 @@ def choose_top_movies(
     base_scored = []
     eligible_movies = []
     for movie in load_movies():
+        if preferred_languages and movie.original_language not in preferred_languages:
+            continue
         if strict_min_year:
             if movie.year is None or min_year is None or movie.year < min_year:
                 continue
@@ -1777,6 +1937,12 @@ def choose_top_movies(
     if not top_movies:
         fallback_pool = [movie for movie in eligible_movies if movie.tmdb_id not in watched_ids]
         if not fallback_pool:
+            fallback_pool = [
+                movie
+                for movie in load_movies()
+                if movie.tmdb_id not in watched_ids and (not preferred_languages or movie.original_language in preferred_languages)
+            ]
+        if not fallback_pool:
             fallback_pool = [movie for movie in load_movies() if movie.tmdb_id not in watched_ids]
         fallback = max(fallback_pool, key=lambda item: item.quality_score)
         top_movies = [fallback]
@@ -1784,7 +1950,13 @@ def choose_top_movies(
     return top_movies, signals, history_profile, watched_ids
 
 
-def get_recommendation(preferences: str, history: list[str], history_ids: list[int] = []) -> dict:
+def get_recommendation(
+    preferences: str,
+    history: list[str],
+    history_ids: list[int] = [],
+    data_file: str | Path | None = None,
+) -> dict:
+    set_data_path(data_file)
     start_time = time.monotonic()
     movies, signals, history_profile, watched_ids = choose_top_movies(preferences, history, history_ids, top_k=5)
     candidate = agentic_judge_and_describe(movies, preferences, history, signals, history_profile, start_time)
@@ -1808,6 +1980,7 @@ def main() -> None:
     parser.add_argument("--preferences", help="Free-text user preferences.")
     parser.add_argument("--history", nargs="*", help="Watched movie titles. Use repeated args or pipe-separated values.")
     parser.add_argument("--history-ids", nargs="*", type=int, help="TMDB IDs corresponding to the watch history.")
+    parser.add_argument("--data-file", help="Path to the movie catalog spreadsheet (.xlsx).")
     args = parser.parse_args()
 
     preferences = args.preferences or input("Preferences: ").strip()
@@ -1817,7 +1990,7 @@ def main() -> None:
         else _parse_history_arg([input("Watch history (optional): ").strip()])
     )
     history_ids = args.history_ids or []
-    print(get_recommendation(preferences, history, history_ids))
+    print(get_recommendation(preferences, history, history_ids, data_file=args.data_file))
 
 
 if __name__ == "__main__":
