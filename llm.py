@@ -18,7 +18,6 @@ from typing import Iterable
 
 from openpyxl import load_workbook
 
-    
 DATA_PATH = Path(__file__).with_name("tmdb_top1000_movies.xlsx")
 DESCRIPTION_LIMIT = 500
 MODEL = "gemma4:31b-cloud"
@@ -76,6 +75,9 @@ LANGUAGE_ALIASES = {
     "portuguese": {"pt"},
     "chinese": {"zh"},
     "mandarin": {"zh"},
+    "中文": {"zh"},
+    "华语": {"zh"},
+    "国语": {"zh"},
 }
 
 COUNTRY_ALIASES = {
@@ -85,6 +87,8 @@ COUNTRY_ALIASES = {
     "portuguese": {"country_tokens": {"portugal", "brazil"}, "language_codes": {"pt"}},
     "china": {"country_tokens": {"china"}, "language_codes": {"zh"}},
     "chinese": {"country_tokens": {"china"}, "language_codes": {"zh"}},
+    "中国": {"country_tokens": {"china"}, "language_codes": {"zh"}},
+    "中文": {"country_tokens": {"china"}, "language_codes": {"zh"}},
     "japan": {"country_tokens": {"japan"}, "language_codes": {"ja"}},
     "japanese": {"country_tokens": {"japan"}, "language_codes": {"ja"}},
     "korea": {"country_tokens": {"korea"}, "language_codes": {"ko"}},
@@ -349,8 +353,10 @@ def _ascii_text(text: str) -> str:
 
 def normalize_text(text: str) -> str:
     lowered = _ascii_text(text).lower()
+    if not lowered.strip() and text:
+        lowered = str(text).lower()
     lowered = re.sub(r"&", " and ", lowered)
-    lowered = re.sub(r"[^a-z0-9]+", " ", lowered)
+    lowered = re.sub(r"[^a-z0-9\u4e00-\u9fff]+", " ", lowered)
     return re.sub(r"\s+", " ", lowered).strip()
 
 
@@ -369,6 +375,8 @@ def contains_normalized_phrase(normalized_text: str, phrase: str) -> bool:
     phrase_norm = normalize_text(phrase)
     if not phrase_norm:
         return False
+    if re.search(r"[\u4e00-\u9fff]", normalized_text) or re.search(r"[\u4e00-\u9fff]", phrase_norm):
+        return phrase_norm in normalized_text
     return f" {phrase_norm} " in f" {normalized_text} "
 
 
@@ -1743,6 +1751,15 @@ def choose_top_movies(
         score = score_movie(movie, query_weights, signals, history_profile, watched_ids)
         if math.isfinite(score):
             base_scored.append((score, movie))
+
+    if wants_absolute_worst_movie(preferences):
+        worst_candidates = [
+            movie for movie in eligible_movies if movie.tmdb_id not in watched_ids and movie.vote_average is not None
+        ]
+        worst_candidates.sort(key=lambda movie: (movie.vote_average, -movie.vote_count, movie.popularity))
+        top_movies = worst_candidates[:top_k]
+        if top_movies:
+            return top_movies, signals, history_profile, watched_ids
 
     base_scored.sort(key=lambda item: item[0], reverse=True)
 
