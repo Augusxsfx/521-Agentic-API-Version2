@@ -1,12 +1,11 @@
 from __future__ import annotations
 
+import importlib
 from pathlib import Path
 
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel, Field
 
-import eval_output_stability
-import eval_parser_regressions
 import llm
 
 
@@ -33,6 +32,21 @@ class RegressionRequest(BaseModel):
     show_only_failures: bool = False
 
 
+def _load_optional_module(module_name: str, required_path: Path):
+    if not required_path.exists():
+        raise HTTPException(
+            status_code=404,
+            detail=f"{module_name} is not available in this deployment.",
+        )
+    try:
+        return importlib.import_module(module_name)
+    except ModuleNotFoundError as exc:
+        raise HTTPException(
+            status_code=404,
+            detail=f"{module_name} is not available in this deployment.",
+        ) from exc
+
+
 def _filter_case_list(cases: list[dict], case_names: list[str] | None = None, limit: int | None = None) -> list[dict]:
     if case_names:
         wanted = set(case_names)
@@ -44,10 +58,15 @@ def _filter_case_list(cases: list[dict], case_names: list[str] | None = None, li
 
 @app.get("/")
 def read_root() -> dict[str, object]:
+    routes = ["/health", "/recommend"]
+    if PARSER_CASES_PATH.exists():
+        routes.append("/regressions/parser")
+    if STABILITY_CASES_PATH.exists():
+        routes.append("/regressions/stability")
     return {
         "service": "bams-521-movie-recommender",
         "status": "ok",
-        "routes": ["/health", "/recommend", "/regressions/parser", "/regressions/stability"],
+        "routes": routes,
     }
 
 
@@ -76,6 +95,7 @@ def recommend(request: RecommendationRequest) -> dict[str, object]:
 @app.post("/regressions/parser")
 def run_parser_regressions(request: RegressionRequest) -> dict[str, object]:
     try:
+        eval_parser_regressions = _load_optional_module("eval_parser_regressions", PARSER_CASES_PATH)
         cases = eval_parser_regressions.load_cases(PARSER_CASES_PATH)
         cases = _filter_case_list(cases, case_names=request.case_names, limit=request.limit)
         results = eval_parser_regressions.run_cases(cases)
@@ -93,6 +113,7 @@ def run_parser_regressions(request: RegressionRequest) -> dict[str, object]:
 @app.post("/regressions/stability")
 def run_stability_regressions(request: RegressionRequest) -> dict[str, object]:
     try:
+        eval_output_stability = _load_optional_module("eval_output_stability", STABILITY_CASES_PATH)
         cases = eval_output_stability.load_cases(STABILITY_CASES_PATH)
         cases = _filter_case_list(cases, case_names=request.case_names, limit=request.limit)
         results = eval_output_stability.run_cases(cases)
