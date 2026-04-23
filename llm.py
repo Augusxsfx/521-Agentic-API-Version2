@@ -17,7 +17,21 @@ from pathlib import Path
 from typing import Iterable
 
 from openpyxl import load_workbook
+from fastapi import FastAPI
+from fastapi.middleware.cors import CORSMiddleware
 
+
+app = FastAPI()
+
+@app.post("/recommend")
+def recommend_endpoint(payload: dict):
+    # This calls your required function
+    return get_recommendation(
+        payload.get("preferences", ""), 
+        payload.get("history", []), 
+        payload.get("history_ids", [])
+    )
+    
 DATA_PATH = Path(__file__).with_name("tmdb_top1000_movies.xlsx")
 DESCRIPTION_LIMIT = 500
 MODEL = "gemma4:31b-cloud"
