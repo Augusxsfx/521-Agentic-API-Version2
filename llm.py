@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import csv
 import importlib
 import math
 import re
@@ -16,9 +17,7 @@ from functools import lru_cache
 from pathlib import Path
 from typing import Iterable
 
-from openpyxl import load_workbook
-
-DEFAULT_DATA_PATH = Path(__file__).with_name("tmdb_top1000_movies.xlsx")
+DEFAULT_DATA_PATH = Path(__file__).with_name("tmdb_top1000_movies.csv")
 DATA_PATH = Path(os.getenv("MOVIE_DATA_PATH", str(DEFAULT_DATA_PATH))).expanduser()
 DESCRIPTION_LIMIT = 500
 MODEL = "gemma4:31b-cloud"
@@ -76,9 +75,9 @@ LANGUAGE_ALIASES = {
     "portuguese": {"pt"},
     "chinese": {"zh"},
     "mandarin": {"zh"},
-    "中文": {"zh"},
-    "华语": {"zh"},
-    "国语": {"zh"},
+    "\u4e2d\u6587": {"zh"},
+    "\u534e\u8bed": {"zh"},
+    "\u56fd\u8bed": {"zh"},
 }
 
 COUNTRY_ALIASES = {
@@ -88,8 +87,8 @@ COUNTRY_ALIASES = {
     "portuguese": {"country_tokens": {"portugal", "brazil"}, "language_codes": {"pt"}},
     "china": {"country_tokens": {"china"}, "language_codes": {"zh"}},
     "chinese": {"country_tokens": {"china"}, "language_codes": {"zh"}},
-    "中国": {"country_tokens": {"china"}, "language_codes": {"zh"}},
-    "中文": {"country_tokens": {"china"}, "language_codes": {"zh"}},
+    "\u4e2d\u56fd": {"country_tokens": {"china"}, "language_codes": {"zh"}},
+    "\u4e2d\u6587": {"country_tokens": {"china"}, "language_codes": {"zh"}},
     "japan": {"country_tokens": {"japan"}, "language_codes": {"ja"}},
     "japanese": {"country_tokens": {"japan"}, "language_codes": {"ja"}},
     "korea": {"country_tokens": {"korea"}, "language_codes": {"ko"}},
@@ -387,6 +386,54 @@ class Movie:
     quality_score: float
 
 
+class _CompatSeries(list):
+    def astype(self, dtype):
+        if dtype in (int, "int", "int64"):
+            caster = int
+        elif dtype in (float, "float", "float64"):
+            caster = float
+        elif dtype in (str, "str", "string"):
+            caster = str
+        elif callable(dtype):
+            caster = dtype
+        else:
+            raise TypeError(f"Unsupported astype target: {dtype!r}")
+        return _CompatSeries(caster(value) for value in self)
+
+
+class _CompatMovieTable:
+    columns = (
+        "tmdb_id",
+        "title",
+        "original_language",
+        "year",
+        "runtime_min",
+        "genres",
+        "production_companies",
+        "production_countries",
+        "overview",
+        "tagline",
+        "director",
+        "cast",
+        "keywords",
+        "popularity",
+        "vote_average",
+        "vote_count",
+        "us_rating",
+    )
+
+    def __getitem__(self, key: str) -> _CompatSeries:
+        if key not in self.columns:
+            raise KeyError(key)
+        return _CompatSeries(getattr(movie, key) for movie in load_movies())
+
+    def __len__(self) -> int:
+        return len(load_movies())
+
+
+TOP_MOVIES = _CompatMovieTable()
+
+
 def _ascii_text(text: str) -> str:
     return unicodedata.normalize("NFKD", text or "").encode("ascii", "ignore").decode("ascii")
 
@@ -489,6 +536,8 @@ def set_data_path(data_file: str | Path | None = None) -> Path:
     global DATA_PATH
 
     candidate = Path(data_file).expanduser() if data_file else DEFAULT_DATA_PATH
+    if candidate.suffix.lower() != ".csv":
+        raise ValueError(f"Movie catalog must be a CSV file: {candidate}")
     if candidate == DATA_PATH:
         return DATA_PATH
 
@@ -506,51 +555,47 @@ def load_movies() -> tuple[Movie, ...]:
     if not DATA_PATH.exists():
         raise FileNotFoundError(f"Movie catalog not found: {DATA_PATH}")
 
-    workbook = load_workbook(DATA_PATH, read_only=True, data_only=True)
-    sheet = workbook.active
-    rows = sheet.iter_rows(values_only=True)
-    headers = [str(value) for value in next(rows)]
-    index = {name: idx for idx, name in enumerate(headers)}
-
     raw_movies: list[dict[str, object]] = []
     max_popularity = 1.0
     max_vote = 1.0
     max_vote_count = 1.0
 
-    for row in rows:
-        tmdb_id = _safe_int(row[index["tmdb_id"]])
-        title = str(row[index["title"]] or "").strip()
-        if not tmdb_id or not title:
-            continue
+    with DATA_PATH.open("r", encoding="utf-8-sig", newline="") as csv_file:
+        reader = csv.DictReader(csv_file)
+        for row in reader:
+            tmdb_id = _safe_int(row.get("tmdb_id"))
+            title = str(row.get("title") or "").strip()
+            if not tmdb_id or not title:
+                continue
 
-        popularity = _safe_float(row[index["popularity"]])
-        vote_average = _safe_float(row[index["vote_average"]])
-        vote_count = _safe_int(row[index["vote_count"]]) or 0
+            popularity = _safe_float(row.get("popularity"))
+            vote_average = _safe_float(row.get("vote_average"))
+            vote_count = _safe_int(row.get("vote_count")) or 0
 
-        raw_movie = {
-            "tmdb_id": tmdb_id,
-            "title": title,
-            "original_language": str(row[index["original_language"]] or "").strip().lower(),
-            "year": _safe_int(row[index["year"]]),
-            "runtime_min": _safe_int(row[index["runtime_min"]]),
-            "genres": split_csvish(row[index["genres"]]),
-            "production_companies": split_csvish(row[index["production_companies"]]),
-            "production_countries": split_csvish(row[index["production_countries"]]),
-            "overview": str(row[index["overview"]] or "").strip(),
-            "tagline": str(row[index["tagline"]] or "").strip(),
-            "director": str(row[index["director"]] or "").strip(),
-            "cast": split_csvish(row[index["top_cast"]]),
-            "keywords": split_csvish(row[index["keywords"]]),
-            "popularity": popularity,
-            "vote_average": vote_average,
-            "vote_count": vote_count,
-            "us_rating": str(row[index["us_rating"]] or "").strip(),
-        }
+            raw_movie = {
+                "tmdb_id": tmdb_id,
+                "title": title,
+                "original_language": str(row.get("original_language") or "").strip().lower(),
+                "year": _safe_int(row.get("year")),
+                "runtime_min": _safe_int(row.get("runtime_min")),
+                "genres": split_csvish(row.get("genres")),
+                "production_companies": split_csvish(row.get("production_companies")),
+                "production_countries": split_csvish(row.get("production_countries")),
+                "overview": str(row.get("overview") or "").strip(),
+                "tagline": str(row.get("tagline") or "").strip(),
+                "director": str(row.get("director") or "").strip(),
+                "cast": split_csvish(row.get("top_cast")),
+                "keywords": split_csvish(row.get("keywords")),
+                "popularity": popularity,
+                "vote_average": vote_average,
+                "vote_count": vote_count,
+                "us_rating": str(row.get("us_rating") or "").strip(),
+            }
 
-        raw_movies.append(raw_movie)
-        max_popularity = max(max_popularity, popularity)
-        max_vote = max(max_vote, vote_average)
-        max_vote_count = max(max_vote_count, float(vote_count))
+            raw_movies.append(raw_movie)
+            max_popularity = max(max_popularity, popularity)
+            max_vote = max(max_vote, vote_average)
+            max_vote_count = max(max_vote_count, float(vote_count))
 
     movies: list[Movie] = []
     for raw_movie in raw_movies:
@@ -1980,7 +2025,7 @@ def main() -> None:
     parser.add_argument("--preferences", help="Free-text user preferences.")
     parser.add_argument("--history", nargs="*", help="Watched movie titles. Use repeated args or pipe-separated values.")
     parser.add_argument("--history-ids", nargs="*", type=int, help="TMDB IDs corresponding to the watch history.")
-    parser.add_argument("--data-file", help="Path to the movie catalog spreadsheet (.xlsx).")
+    parser.add_argument("--data-file", help="Path to the movie catalog CSV file.")
     args = parser.parse_args()
 
     preferences = args.preferences or input("Preferences: ").strip()
